@@ -31,21 +31,21 @@ Windows PowerShell 的环境创建与激活方式见 [Installation](#installatio
 
 ```mermaid
 flowchart LR
-    A[Source field A] --> N1[Normalize + character IDs]
-    B[Target field B] --> N2[Normalize + character IDs]
-    N1 --> E[Shared Char CNN Encoder]
+    A["Source field A"] --> N1["Normalize + character IDs"]
+    B["Target field B"] --> N2["Normalize + character IDs"]
+    N1 --> E["Shared Char CNN Encoder"]
     N2 --> E
-    E --> EA[128-d normalized embedding A]
-    E --> EB[128-d normalized embedding B]
-    EA --> R[Cosine retrieval: A @ B.T]
+    E --> EA["128-d normalized embedding A"]
+    E --> EB["128-d normalized embedding B"]
+    EA --> R["Cosine retrieval: A @ B.T"]
     EB --> R
-    R --> K[Top-K candidates]
-    EA --> F[concat a, b, abs(a-b), a*b]
+    R --> K["Top-K candidates"]
+    EA --> F["concat(a, b, abs(a - b), a * b)"]
     EB --> F
     K --> F
-    F --> C[Pair MLP Classifier]
-    C --> P[NO_MATCH / DIRECT / DERIVATION]
-    P --> T[Threshold decision]
+    F --> C["Pair MLP Classifier"]
+    C --> P["NO_MATCH / DIRECT / DERIVATION"]
+    P --> T["Threshold decision"]
 ```
 
 默认 `FieldEncoder` 结构：
