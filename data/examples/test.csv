@@ -1,0 +1,9 @@
+A,B,label
+supplier_no,vendor_id,DIRECT
+txn_amt,transaction_amount,DIRECT
+delivery_dt,delivery_date,DIRECT
+hire_date,tenure_months,DERIVATION
+list_price,discounted_price,DERIVATION
+middle_name,warehouse_id,NO_MATCH
+longitude,invoice_status,NO_MATCH
+currency,telephone_number,NO_MATCH

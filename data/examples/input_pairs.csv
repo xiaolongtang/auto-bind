@@ -1,0 +1,5 @@
+A,B
+sale_price,SalePrice
+customer_no,client_id
+trade_date,settlement_date
+sale_price,employee_id

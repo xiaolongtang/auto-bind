@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metadata-field-matcher"
+version = "0.1.0"
+description = "Offline CPU-only metadata field matching MVP using a Siamese character CNN"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "torch",
+  "pandas",
+  "numpy",
+  "scikit-learn",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

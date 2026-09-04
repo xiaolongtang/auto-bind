@@ -1,0 +1,38 @@
+# Python bytecode and tooling
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and packaging
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local logs and outputs
+*.log
+predictions.csv
+predicted_pairs.csv
+candidates.csv
+
+# Enterprise datasets: keep documentation and synthetic examples only
+data/*.csv
+!data/examples/
+!data/examples/*.csv
+
+# Model runs can contain sensitive learned artifacts
+artifacts/*
+!artifacts/.gitkeep

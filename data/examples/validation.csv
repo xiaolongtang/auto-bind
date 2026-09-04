@@ -1,0 +1,8 @@
+A,B,label
+member_key,subscriber_id,DIRECT
+created_ts,creation_timestamp,DIRECT
+sku_desc,item_description,DIRECT
+start_date,end_date,DERIVATION
+quantity,line_total,DERIVATION
+region_code,payment_method,NO_MATCH
+contract_status,latitude,NO_MATCH

@@ -1,0 +1,15 @@
+A,B,label
+sale_price,SalePrice,DIRECT
+customer_no,client_id,DIRECT
+order_dt,OrderDate,DIRECT
+employee_num,staff_id,DIRECT
+product_cd,product_code,DIRECT
+postal_cd,zip_code,DIRECT
+trade_date,settlement_date,DERIVATION
+gross_amt,net_amount,DERIVATION
+birth_date,age_years,DERIVATION
+invoice_total,tax_due,DERIVATION
+phone_no,warehouse_code,NO_MATCH
+account_balance,country_name,NO_MATCH
+ship_city,currency_code,NO_MATCH
+item_quantity,manager_email,NO_MATCH
