@@ -29,17 +29,19 @@ def test_pair_dataset_shapes_and_label_mapping() -> None:
     dataset = PairDataset(dataframe, vocab, max_length=16)
 
     sample = dataset[2]
-    assert set(sample) == {"a_ids", "b_ids", "label"}
+    assert set(sample) == {"a_ids", "b_ids", "label", "sample_weight"}
     assert sample["a_ids"].shape == (16,)
     assert sample["b_ids"].shape == (16,)
     assert sample["a_ids"].dtype == torch.long
     assert sample["label"].shape == ()
     assert sample["label"].item() == LABEL_MAP["DERIVATION"]
+    assert sample["sample_weight"].item() == 1.0
 
     batch = next(iter(DataLoader(dataset, batch_size=2)))
     assert batch["a_ids"].shape == (2, 16)
     assert batch["b_ids"].shape == (2, 16)
     assert batch["label"].shape == (2,)
+    assert batch["sample_weight"].shape == (2,)
 
 
 def test_pair_dataset_rejects_unknown_label() -> None:
@@ -47,6 +49,66 @@ def test_pair_dataset_rejects_unknown_label() -> None:
     dataframe.loc[0, "label"] = "MAYBE"
     vocab = build_training_vocabulary(dataframe)
     with pytest.raises(ValueError, match="unsupported labels"):
+        PairDataset(dataframe, vocab)
+
+
+@pytest.mark.parametrize("conflicting_label", ["NO_MATCH", "DERIVATION"])
+def test_pair_dataset_rejects_normalized_conflicting_labels(
+    conflicting_label: str,
+) -> None:
+    dataframe = pd.DataFrame(
+        {
+            "A": ["sale_price", "SalePrice"],
+            "B": ["SalePrice", "sale-price"],
+            "label": ["DIRECT", conflicting_label],
+        }
+    )
+    with pytest.raises(ValueError, match="conflicting labels after normalization") as exc:
+        PairDataset(dataframe, build_training_vocabulary(dataframe))
+    assert "CSV row 2" in str(exc.value)
+    assert "CSV row 3" in str(exc.value)
+    assert "DIRECT" in str(exc.value)
+    assert conflicting_label in str(exc.value)
+
+
+def test_pair_dataset_accepts_same_label_normalized_duplicates() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "A": ["sale_price", "SalePrice"],
+            "B": ["SalePrice", "sale-price"],
+            "label": ["DIRECT", " direct "],
+        }
+    )
+    dataset = PairDataset(dataframe, build_training_vocabulary(dataframe))
+    assert len(dataset) == 2
+    assert torch.equal(dataset[0]["a_ids"], dataset[1]["a_ids"])
+    assert torch.equal(dataset[0]["b_ids"], dataset[1]["b_ids"])
+
+
+def test_pair_dataset_weights_only_explicit_synthetic_negatives() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "A": ["first", "second", "third"],
+            "B": ["one", "two", "three"],
+            "label": ["DIRECT", "NO_MATCH", "NO_MATCH"],
+            "synthetic": [False, False, True],
+        }
+    )
+    dataset = PairDataset(
+        dataframe, build_training_vocabulary(dataframe), synthetic_negative_weight=0.25
+    )
+    batch = next(iter(DataLoader(dataset, batch_size=3)))
+    assert batch["sample_weight"].tolist() == [1.0, 1.0, 0.25]
+
+
+def test_pair_dataset_rejects_unreliable_provenance() -> None:
+    dataframe = _training_frame()
+    dataframe["synthetic"] = [False, None, False]
+    vocab = build_training_vocabulary(dataframe)
+    with pytest.raises(ValueError, match="synthetic markers must be true or false"):
+        PairDataset(dataframe, vocab)
+    dataframe["synthetic"] = [True, False, False]
+    with pytest.raises(ValueError, match="only NO_MATCH rows"):
         PairDataset(dataframe, vocab)
 
 
@@ -76,11 +138,47 @@ def test_synthetic_negatives_exclude_all_known_positive_pairs() -> None:
 
     assert len(generated) == 6
     assert set(generated["label"]) == {"NO_MATCH"}
+    assert generated["synthetic"].all()
+    assert set(generated["negative_type"]) == {"hard", "random"}
     assert not any(
         (normalize_field_name(row.A), normalize_field_name(row.B))
         in known_positive_pairs
         for row in generated.itertuples()
     )
+
+
+def test_synthetic_negatives_never_pair_normalized_identical_names() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "A": ["customer_no", "customer_identifier"],
+            "B": ["client_id", "CustomerNo"],
+            "label": ["DIRECT", "DIRECT"],
+        }
+    )
+    generated = generate_synthetic_negatives(dataframe)
+    # customer_no has no eligible target: both its positive and itself must be
+    # excluded. customer_identifier is absent from the B universe, so it must
+    # not reduce that universe's eligible count and lose its client_id negative.
+    assert len(generated) == 2
+    assert set(generated["A"]) == {"customer_identifier"}
+    assert set(generated["B"]) == {"client_id"}
+    assert not any(
+        normalize_field_name(row.A) == normalize_field_name(row.B)
+        for row in generated.itertuples()
+    )
+
+
+def test_synthetic_negatives_return_empty_if_only_positive_or_self_remain() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "A": ["first", "second"],
+            "B": ["second", "first"],
+            "label": ["DIRECT", "DIRECT"],
+        }
+    )
+    generated = generate_synthetic_negatives(dataframe)
+    assert generated.empty
+    assert {"synthetic", "negative_type"}.issubset(generated.columns)
 
 
 def test_synthetic_negative_pool_is_seeded_and_bounded(monkeypatch) -> None:
@@ -140,6 +238,8 @@ def test_augmentation_only_happens_without_human_no_match() -> None:
     augmented, generated = augment_training_data_if_needed(positives, seed=5)
     assert generated is True
     assert len(augmented) > len(positives)
+    assert not augmented.iloc[: len(positives)]["synthetic"].any()
+    assert augmented.iloc[len(positives) :]["synthetic"].all()
 
     human_negative = pd.concat(
         [
@@ -152,4 +252,6 @@ def test_augmentation_only_happens_without_human_no_match() -> None:
     )
     untouched, generated = augment_training_data_if_needed(human_negative)
     assert generated is False
-    pd.testing.assert_frame_equal(untouched, human_negative)
+    pd.testing.assert_frame_equal(untouched[human_negative.columns], human_negative)
+    assert not untouched["synthetic"].any()
+    assert set(untouched["negative_type"]) == {"human"}

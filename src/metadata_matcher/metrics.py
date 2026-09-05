@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Hashable, Mapping, Sequence
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -136,6 +137,7 @@ def retrieval_metrics(
     | Sequence[Collection[Hashable] | Hashable],
     *,
     ks: Sequence[int] = (1, 5, 10, 20),
+    mrr_cutoff: int | None = None,
 ) -> dict[str, Any]:
     """Compute per-source Recall@K and mean reciprocal rank (MRR).
 
@@ -148,11 +150,25 @@ def retrieval_metrics(
         rankings: Ranked target IDs, either keyed by source or position aligned.
         ground_truth: One target or a collection of targets for each source.
         ks: Positive recall cutoffs.
+        mrr_cutoff: Retrieval depth for truncated MRR.  With a cutoff, targets
+            below that rank contribute zero and the result is named ``MRR@N``
+            (``mrr_at_N``), never unqualified MRR.  ``None`` assumes callers
+            supplied complete rankings and reports ordinary MRR.
     """
 
     normalized_ks = sorted(set(int(k) for k in ks))
     if not normalized_ks or any(k <= 0 for k in normalized_ks):
         raise ValueError("ks must contain at least one positive integer")
+    if mrr_cutoff is not None:
+        if (
+            isinstance(mrr_cutoff, bool)
+            or not isinstance(mrr_cutoff, Integral)
+            or mrr_cutoff <= 0
+        ):
+            raise ValueError("mrr_cutoff must be a positive integer or None")
+        mrr_cutoff = int(mrr_cutoff)
+        if max(normalized_ks) > mrr_cutoff:
+            raise ValueError("Recall cutoffs must not exceed mrr_cutoff")
 
     if isinstance(ground_truth, Mapping):
         if not isinstance(rankings, Mapping):
@@ -183,7 +199,10 @@ def retrieval_metrics(
             continue
         evaluated += 1
         first_relevant_rank: int | None = None
-        for rank, target in enumerate(ranked_targets, start=1):
+        evaluated_ranking = (
+            ranked_targets if mrr_cutoff is None else ranked_targets[:mrr_cutoff]
+        )
+        for rank, target in enumerate(evaluated_ranking, start=1):
             if target in relevant_targets:
                 first_relevant_rank = rank
                 break
@@ -197,7 +216,6 @@ def retrieval_metrics(
         k: (hits[k] / evaluated if evaluated > 0 else 0.0) for k in normalized_ks
     }
     result: dict[str, Any] = {
-        "mrr": reciprocal_rank_sum / evaluated if evaluated > 0 else 0.0,
         "evaluated_sources": evaluated,
         "skipped_without_truth": skipped,
         "recall_at_k": {str(k): recalls[k] for k in normalized_ks},
@@ -206,7 +224,12 @@ def retrieval_metrics(
     for k in normalized_ks:
         result[f"recall_at_{k}"] = recalls[k]
         result[f"Recall@{k}"] = recalls[k]
-    result["MRR"] = result["mrr"]
+    mrr = reciprocal_rank_sum / evaluated if evaluated > 0 else 0.0
+    if mrr_cutoff is None:
+        result["mrr"] = result["MRR"] = mrr
+    else:
+        result[f"mrr_at_{mrr_cutoff}"] = result[f"MRR@{mrr_cutoff}"] = mrr
+        result["mrr_cutoff"] = mrr_cutoff
     return result
 
 
@@ -265,6 +288,7 @@ def end_to_end_metrics(
     thresholds: Sequence[float] = (0.80, 0.90, 0.95, 0.99),
     review_threshold: float | None = None,
     auto_accept_threshold: float = 0.95,
+    ground_truth_complete: Sequence[bool] | None = None,
 ) -> dict[str, Any]:
     """Compute group-matching and confidence-gating metrics.
 
@@ -272,6 +296,14 @@ def end_to_end_metrics(
     target and relationship are counted independently, while ``overall`` requires
     both to be correct.  For target-specific relationship truth, callers should
     precompute each row's accepted relationship set for ``true_labels``.
+
+    A source is eligible for group-level metrics only when its corresponding
+    ``ground_truth_complete`` flag is explicitly true: the caller confirms all
+    positive targets in the evaluation candidate group have been annotated.
+    An empty target set otherwise means unknown, not a confirmed group-level
+    ``NO_MATCH``.  Flags default to false.  Top-1/raw-positive diagnostics still
+    use all sources with known positives and are not full-ground-truth accuracy.
+    Group metrics are ``None`` when no source has complete annotations.
     """
 
     total = len(predicted_targets)
@@ -283,6 +315,17 @@ def end_to_end_metrics(
         == total
     ):
         raise ValueError("All end-to-end metric inputs must have equal length")
+    if ground_truth_complete is None:
+        complete_mask = np.zeros(total, dtype=bool)
+    else:
+        if len(ground_truth_complete) != total:
+            raise ValueError("ground_truth_complete must have one flag per source")
+        if any(
+            not isinstance(flag, (bool, np.bool_))
+            for flag in ground_truth_complete
+        ):
+            raise ValueError("ground_truth_complete must contain only boolean flags")
+        complete_mask = np.asarray(ground_truth_complete, dtype=bool)
 
     relevant_target_sets = [_as_relevant_set(truth) for truth in true_targets]
     positive_mask = np.asarray(
@@ -303,12 +346,40 @@ def end_to_end_metrics(
         dtype=bool,
     )
     overall_correct = np.logical_and(target_correct, label_correct)
-    denominator = total if total > 0 else 1
+    evaluated_count = int(complete_mask.sum())
+    incomplete_count = total - evaluated_count
     positive_count = int(positive_mask.sum())
     positive_denominator = positive_count if positive_count > 0 else 1
-    threshold_table = threshold_precision_coverage(
-        overall_correct, match_probabilities, thresholds=thresholds
-    )
+    confidence_array = _to_numpy(match_probabilities).astype(float)
+    if confidence_array.ndim != 1:
+        raise ValueError("match_probabilities must be one-dimensional")
+    if not np.all(np.isfinite(confidence_array)):
+        raise ValueError("match_probabilities must contain only finite values")
+
+    def complete_group_threshold_table(
+        cutoffs: Sequence[float],
+    ) -> list[dict[str, Any]]:
+        table = threshold_precision_coverage(
+            overall_correct[complete_mask],
+            confidence_array[complete_mask],
+            thresholds=cutoffs,
+        )
+        for entry in table:
+            all_accepted = confidence_array >= entry["threshold"]
+            entry["evaluated_sources"] = evaluated_count
+            entry["excluded_incomplete_accepted_count"] = int(
+                np.logical_and(all_accepted, ~complete_mask).sum()
+            )
+            entry["all_sources_accepted_count"] = int(all_accepted.sum())
+            entry["all_sources_coverage"] = (
+                float(all_accepted.sum() / total) if total else None
+            )
+            if not evaluated_count:
+                entry["precision"] = None
+                entry["coverage"] = None
+        return table
+
+    threshold_table = complete_group_threshold_table(thresholds)
 
     resolved_review_threshold = (
         float(review_threshold)
@@ -322,16 +393,12 @@ def end_to_end_metrics(
         raise ValueError("auto_accept_threshold must be in [0, 1]")
     if resolved_auto_accept_threshold < resolved_review_threshold:
         raise ValueError("auto_accept_threshold must be >= review_threshold")
-    auto_accept = threshold_precision_coverage(
-        overall_correct,
-        match_probabilities,
-        thresholds=(resolved_auto_accept_threshold,),
-    )[0]
-    confidence_array = _to_numpy(match_probabilities).astype(float).reshape(-1)
+    auto_accept = complete_group_threshold_table((resolved_auto_accept_threshold,))[0]
     accepted_at_review = confidence_array >= resolved_review_threshold
     no_match_mask = np.logical_not(positive_mask)
     # At the operational review gate, a rejected positive is a miss while a
-    # rejected source with no positive truth is a correct NO_MATCH decision.
+    # rejected source with COMPLETE empty truth is a correct NO_MATCH decision.
+    # Incomplete sources are masked out below, never inferred to be negatives.
     gated_overall_correct = np.where(
         positive_mask,
         np.logical_and(accepted_at_review, overall_correct),
@@ -342,16 +409,18 @@ def end_to_end_metrics(
         np.logical_and(accepted_at_review, label_correct),
         np.logical_not(accepted_at_review),
     )
-    return {
+    result: dict[str, Any] = {
         "top_1_correct_match_rate": float(
             np.logical_and(target_correct, positive_mask).sum()
             / positive_denominator
         ),
-        "relationship_classification_accuracy": float(
-            gated_relationship_correct.sum() / denominator
+        "relationship_classification_accuracy": (
+            float(gated_relationship_correct[complete_mask].sum() / evaluated_count)
+            if evaluated_count else None
         ),
-        "overall_end_to_end_accuracy": float(
-            gated_overall_correct.sum() / denominator
+        "overall_end_to_end_accuracy": (
+            float(gated_overall_correct[complete_mask].sum() / evaluated_count)
+            if evaluated_count else None
         ),
         "raw_positive_relationship_classification_accuracy": float(
             np.logical_and(label_correct, positive_mask).sum()
@@ -363,13 +432,38 @@ def end_to_end_metrics(
         ),
         "review_threshold": resolved_review_threshold,
         "auto_accept_threshold": resolved_auto_accept_threshold,
-        "auto_accept_precision": float(auto_accept["precision"]),
-        "coverage": float(auto_accept["coverage"]),
+        "auto_accept_precision": auto_accept["precision"],
+        "coverage": auto_accept["coverage"],
+        "auto_accept_count": auto_accept["accepted_count"],
+        "all_sources_auto_accept_coverage": auto_accept["all_sources_coverage"],
+        "excluded_incomplete_auto_accept_count": auto_accept[
+            "excluded_incomplete_accepted_count"
+        ],
         "threshold_precision_coverage": threshold_table,
-        "evaluated_sources": total,
-        "positive_sources": positive_count,
-        "no_match_only_sources": int(no_match_mask.sum()),
+        "total_sources": total,
+        "evaluated_sources": evaluated_count,
+        "excluded_incomplete_sources": incomplete_count,
+        "known_positive_sources": positive_count,
+        "positive_sources": int(np.logical_and(positive_mask, complete_mask).sum()),
+        "incomplete_positive_sources": int(
+            np.logical_and(positive_mask, ~complete_mask).sum()
+        ),
+        "no_match_only_sources": int(
+            np.logical_and(no_match_mask, complete_mask).sum()
+        ),
+        "unknown_no_match_sources": int(
+            np.logical_and(no_match_mask, ~complete_mask).sum()
+        ),
+        "positive_diagnostics_scope": "all_sources_with_known_positive_targets",
     }
+    if incomplete_count:
+        result["warning"] = (
+            f"Excluded {incomplete_count} source(s) with incomplete ground truth "
+            "from group-level accuracy and threshold precision/coverage. Missing "
+            "positive annotations do not prove group-level NO_MATCH. Top-1 and "
+            "raw-positive diagnostics use known positives only."
+        )
+    return result
 
 
 # Backwards-friendly singular name for callers that think of this as a report.

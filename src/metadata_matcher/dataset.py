@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
+from numbers import Real
 from pathlib import Path
 from typing import TypedDict
 
@@ -28,6 +30,49 @@ class PairSample(TypedDict):
     a_ids: torch.Tensor
     b_ids: torch.Tensor
     label: torch.Tensor
+    sample_weight: torch.Tensor
+
+
+def validate_normalized_pair_labels(
+    dataframe: pd.DataFrame,
+    *,
+    source_column: str = "A",
+    target_column: str = "B",
+    label_column: str = "label",
+    context: str = "pair dataframe",
+) -> None:
+    """Reject contradictory labels for the same ordered normalized pair.
+
+    Row numbers are one-based CSV record numbers, including the header. Case
+    and separator variants with the same label remain valid duplicate records.
+    """
+
+    first_seen: dict[tuple[str, str], tuple[str, int, str, str]] = {}
+    conflicts: list[str] = []
+    values = dataframe[[source_column, target_column, label_column]]
+    for row_number, (source, target, label) in enumerate(
+        values.itertuples(index=False, name=None), start=2
+    ):
+        source, target = str(source), str(target)
+        label = str(label).strip().upper()
+        pair = (normalize_field_name(source), normalize_field_name(target))
+        previous = first_seen.get(pair)
+        if previous is None:
+            first_seen[pair] = (label, row_number, source, target)
+        elif previous[0] != label:
+            conflicts.append(
+                f"normalized pair {pair!r}: CSV row {previous[1]} "
+                f"({previous[2]!r}, {previous[3]!r})={previous[0]} conflicts "
+                f"with CSV row {row_number} ({source!r}, {target!r})={label}"
+            )
+            if len(conflicts) == 10:
+                break
+    if conflicts:
+        raise ValueError(
+            f"{context} has conflicting labels after normalization; "
+            + "; ".join(conflicts)
+            + ". Correct the original annotations before training or evaluation."
+        )
 
 
 def load_pair_csv(
@@ -86,8 +131,9 @@ class PairDataset(Dataset[PairSample]):
     """Fixed-length encoded field pairs and integer relationship labels.
 
     Each item is a dictionary with ``a_ids`` and ``b_ids`` tensors of shape
-    ``[max_length]`` and a scalar ``label`` tensor.  PyTorch's default collate
-    function therefore produces ``[batch, max_length]`` and ``[batch]``.
+    ``[max_length]`` and scalar ``label`` / ``sample_weight`` tensors. PyTorch's
+    default collate produces ``[batch, max_length]`` and ``[batch]``. Only rows
+    explicitly marked ``synthetic=True`` receive the configured negative weight.
     """
 
     def __init__(
@@ -100,11 +146,19 @@ class PairDataset(Dataset[PairSample]):
         source_column: str = "A",
         target_column: str = "B",
         label_column: str = "label",
+        synthetic_negative_weight: float = 1.0,
     ) -> None:
         """Validate and retain pair data for on-demand tensor encoding."""
 
         if max_length < 1:
             raise ValueError("max_length must be at least 1")
+        if (
+            isinstance(synthetic_negative_weight, bool)
+            or not isinstance(synthetic_negative_weight, Real)
+            or not math.isfinite(synthetic_negative_weight)
+            or not 0.0 < synthetic_negative_weight <= 1.0
+        ):
+            raise ValueError("synthetic_negative_weight must be finite and in (0, 1]")
         required = {source_column, target_column, label_column}
         missing = sorted(required.difference(dataframe.columns))
         if missing:
@@ -136,6 +190,24 @@ class PairDataset(Dataset[PairSample]):
                 f"unsupported labels {unknown_labels}; expected "
                 f"{sorted(effective_label_map)}"
             )
+        validate_normalized_pair_labels(
+            dataframe,
+            source_column=source_column,
+            target_column=target_column,
+            label_column=label_column,
+        )
+        if "synthetic" in dataframe:
+            flags = dataframe["synthetic"].astype(str).str.strip().str.lower()
+            if not flags.isin({"true", "false"}).all():
+                raise ValueError("synthetic markers must be true or false, without missing values")
+            synthetic_flags = flags.eq("true").tolist()
+        else:
+            synthetic_flags = [False] * len(dataframe)
+        if any(
+            is_synthetic and label != "NO_MATCH"
+            for is_synthetic, label in zip(synthetic_flags, labels)
+        ):
+            raise ValueError("only NO_MATCH rows may be marked synthetic")
 
         self.vocab = vocab
         self.max_length = max_length
@@ -144,6 +216,10 @@ class PairDataset(Dataset[PairSample]):
         self.a_fields = normalized_a
         self.b_fields = normalized_b
         self.labels = [effective_label_map[label] for label in labels]
+        self.sample_weights = [
+            float(synthetic_negative_weight) if synthetic else 1.0
+            for synthetic in synthetic_flags
+        ]
 
     def __len__(self) -> int:
         """Return the number of labeled pairs."""
@@ -163,6 +239,7 @@ class PairDataset(Dataset[PairSample]):
             "a_ids": torch.tensor(a_ids, dtype=torch.long),
             "b_ids": torch.tensor(b_ids, dtype=torch.long),
             "label": torch.tensor(self.labels[index], dtype=torch.long),
+            "sample_weight": torch.tensor(self.sample_weights[index], dtype=torch.float32),
         }
 
 

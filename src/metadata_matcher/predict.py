@@ -527,6 +527,9 @@ def match_field_groups(
     Target embeddings are computed once.  Exact cosine retrieval selects Top-K;
     only those candidates enter the MLP classifier.  Final candidates are ranked
     by ``P(DIRECT) + P(DERIVATION)`` as required by the MVP design.
+    Target names are deduplicated after normalization, matching offline group
+    evaluation; the first original spelling is retained for output. Source rows
+    retain their original order and spelling, including repeated source names.
 
     Returns:
         A tuple ``(best_predictions, candidates_or_none)``.  Candidate rows retain
@@ -535,7 +538,11 @@ def match_field_groups(
 
     bundle = _ensure_bundle(model, device=device)
     raw_sources = [str(value) for value in source_fields]
-    raw_targets = [str(value) for value in target_fields]
+    target_by_normalized: dict[str, str] = {}
+    for value in target_fields:
+        raw_target = str(value)
+        target_by_normalized.setdefault(normalize_field_name(raw_target), raw_target)
+    raw_targets = list(target_by_normalized.values())
     resolved_top_k = bundle.config.top_k if top_k is None else int(top_k)
     resolved_review = (
         bundle.config.review_threshold

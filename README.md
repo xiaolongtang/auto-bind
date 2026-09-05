@@ -99,6 +99,7 @@ Char CNN 的优势是模型小、CPU 友好、训练快、不依赖预训练模�
 │   ├── metrics.py
 │   ├── train.py
 │   ├── evaluate.py
+│   ├── evaluation_truth.py
 │   ├── predict.py
 │   └── utils.py
 ├── scripts/
@@ -166,6 +167,7 @@ sale_price,employee_id,NO_MATCH
 - vocabulary **只从 train dataset 构建**，validation/test 中未见字符映射到 `UNK`，避免数据泄漏；
 - train、validation、test 应由上游固定拆分，优先采用 normalized field-disjoint split；
 - 启动训练时会检查 split 之间的 normalized overlap 并输出明显警告；默认训练命令执行 strict leakage check，发现重叠即终止；
+- 每个 split 内，同一标准化 `(A, B)` 不得出现互斥标签（包括 `DIRECT` 与 `DERIVATION` 冲突）。预检会报出原 CSV 记录行号、字段和标签，并在创建 run 前停止；同标签重复允许，不会静默改写标注；
 - 不要用 validation/test 调参后再把同一结果当作无偏 test 指标；
 - 生产评估应包含人工确认的三类样本，并覆盖真实系统、命名规则及困难负例。
 
@@ -207,6 +209,10 @@ SettlementDate -> settlement_date
 - random negative 从 train 中选择其他 B，并排除所有已知为 `DIRECT`/`DERIVATION` 的真实 A/B pair；
 - hard negative 使用 `difflib.SequenceMatcher` 从名字相似但非已知 positive 的 B 中选择。
 
+两种策略都排除标准化后 `A == B` 的候选，避免给共享 encoder 的相同输入强加负例目标。没有合法候选时跳过该 A；若整个 train 无人工负例且一个合法 synthetic negative 都无法生成，训练会在创建 run 前报错。
+
+生成行携带 `synthetic=true` 和 `negative_type=random/hard`，人工训练行标记为 `synthetic=false`。可在 JSON 中设置 `synthetic_negative_weight`（范围 `(0, 1]`，默认 `1.0` 保持原有权重）。例如 `0.5` 将合成负例在两个训练阶段中的损失贡献减半，人工样本仍为 `1.0`。批损失为 `sum(weight_i * loss_i) / batch_size`；验证损失不降权。`training_history.json` 记录配置权重和两类合成负例数量，便于审计。降权是否改善真实数据表现，需要用人工验证集比较。
+
 生成数量由 `random_negatives_per_positive` 和 `hard_negatives_per_positive` 控制，仅作用于 training。validation/test 默认绝不自动补负例；若其中没有人工确认的 `NO_MATCH`，报告会明确标注 `NO_MATCH metrics unavailable or incomplete`，不能把 synthetic-negative 表现当作真实拒识能力。
 
 ## Configuration
@@ -215,7 +221,7 @@ SettlementDate -> settlement_date
 
 - 模型：`max_length`、字符 embedding/CNN channels/kernel sizes、field embedding dimension、classifier hidden dimensions、dropout；
 - 训练：两阶段 epochs、batch size、learning rates、weight decay、cosine margin、early stopping、seed、是否 joint fine-tune；
-- 负例：random/hard negatives 数量和 hard-negative candidate pool；
+- 负例：random/hard negatives 数量、hard-negative candidate pool 和 `synthetic_negative_weight`；
 - 推理：inference batch size、retrieval chunk size、Top-K 与两个置信阈值；
 - CPU：`torch_num_threads` 和 Windows 兼容的 `num_workers=0`。
 
@@ -249,8 +255,36 @@ python scripts/evaluate_model.py \
 评估包含三层结果：
 
 1. **Pair classification**：accuracy、每类 precision/recall/F1、macro F1 和 confusion matrix；
-2. **Retrieval**：只对 test 中真实 `DIRECT`/`DERIVATION` 计算 Recall@1/5/10/20 和 MRR。同一 A 有多个真实 target 时，任一正确 target 进入 Top-K 即算成功；
-3. **End-to-end**：Top-1 correct match rate、relationship classification accuracy、overall accuracy、auto-accept precision 与 coverage，并报告 0.80、0.90、0.95、0.99 阈值下的 precision/coverage trade-off。
+2. **Retrieval**：对 test 中已标注的 `DIRECT`/`DERIVATION` 计算 Recall@1/5/10/20 和 **MRR@depth**。A、B 均按标准化名称去重；同一 A 有多个真实 target 时，任一正确 target 进入 Top-K 即算成功；
+3. **End-to-end**：Top-1 与 `raw_positive_*` 是针对已知正例的诊断；组级 relationship accuracy、overall accuracy、auto-accept precision 与 coverage 只在标注完整的 A 上计算，并报告 0.80、0.90、0.95、0.99 阈值下的 precision/coverage trade-off。
+
+### Complete group ground truth
+
+一条 `A,B,NO_MATCH` 只证明这个字段对无匹配，不能证明 A 与其他 B 也无匹配。validation/test 可添加可选列 `group_truth_complete`：
+
+```csv
+A,B,label,group_truth_complete
+customer_no,client_id,DIRECT,true
+customer_no,employee_id,NO_MATCH,true
+legacy_code,employee_id,NO_MATCH,true
+partial_code,employee_id,NO_MATCH,false
+```
+
+此例中 `true` 是标注方的明确声明：**相对于当前评估 CSV 中全部标准化去重后的 B，已列出该 A 的全部有效匹配及关系**。因此 `legacy_code` 的空正例集合表示确认的组级无匹配；`partial_code` 仍是未知，不能因模型拒绝它而得分。不需要枚举所有负例，但必须真正审查完整 B 集合；增加 B 后应重新核验完整性。当前一次评估只有一个 B 候选组，不同业务候选组应分别评估。
+
+- 缺少此列时默认全部 `false`；有此列时每行必须是 `true/false`（大小写不敏感），同一标准化 A 的各行必须一致；
+- 不完整 A 不进入组级准确率或 precision/coverage 的分母，即使它已有部分正例。Pair classification 和已知正例的检索指标继续输出，不把未标注候选视为已确认负例；
+- `evaluated_sources` 是完整 A 数量；`excluded_incomplete_sources` 是排除数量，`unknown_no_match_sources` 是没有已知正例且标注不完整的数量；`no_match_only_sources` 仅统计确认的组级无匹配；
+- 没有完整 A 时，组级 accuracy、precision、coverage 输出 JSON `null`，并附带警告，不输出具有误导性的 `0` 或 `1`；
+- 阈值表的 `coverage` 以完整 A 为分母。`all_sources_coverage` 另报所有 A 的通过率，`excluded_incomplete_accepted_count` 显示通过阈值但无法核验的数量；顶层 `all_sources_auto_accept_coverage` 对应自动接受阈值。
+
+现有三列 CSV 和旧模型文件仍可使用，但三列 CSV 不再产生未经完整性确认的组级质量指标。请勿只为了获得指标而批量把该列设为 `true`；示例演示集也不会自动增加此声明。
+
+### Retrieval metric depth
+
+默认深度 `depth = max(20, top_k)`，报告键名例如 `MRR@20` / `mrr_at_20`，不再将截断值称作完整 `MRR` / `mrr`。前 depth 内未出现正确 target 时该 A 的 reciprocal rank 记为 0；例如正确项排第 25 时，MRR@20 为 0，MRR@25 为 1/25。读取旧 JSON 键的下游程序需要更新。
+
+可用 `--retrieval-depth 100` 独立增加检索指标深度，不改变用于 MLP 重排的 `--top-k`。深度不得小于 `max(20, top_k)`；报告包含 `mrr_cutoff`、`retrieval_depth_requested`、`retrieval_depth_effective`、`candidate_targets` 和 `ranking_is_complete`。若候选不足 depth，实际深度会裁剪，但指标名保留请求的截止值。不同深度的指标应分别比较。
 
 ## Predict One Pair
 
@@ -307,6 +341,8 @@ python scripts/match_groups.py \
 模型只计算一次并缓存全部 B embeddings；A 分 batch 编码。因为 embedding 已经 L2-normalized，余弦检索使用矩阵乘法 `A_embeddings @ B_embeddings.T`。对大 B group 使用 chunk/batch 计算，避免创建全部 A×B pair tensor；MVP 不引入 FAISS。
 
 每个 A 只将 retrieval Top-K 候选送入 pair classifier。候选的 relationship 由 `p_direct` 与 `p_derivation` 中较大者决定，最终按 `match_probability` 排序。
+
+B 候选先按标准化名称去重，与评估使用相同规则，避免 `SalePrice` / `sale_price` 等等价拼写重复占用 Top-K。输出的 `best_B` / `candidate_B` 保留首个出现的原始拼写；A 的输入行和输出顺序不变。只有名称的模型无法区分标准化后同名、但业务含义不同的字段，此类数据应先按业务候选组隔离。
 
 ### Prediction Output
 
@@ -378,10 +414,10 @@ artifacts/run_YYYYMMDD_HHMMSS/
 - **F1**：precision 与 recall 的调和平均；
 - **Macro F1**：三类 F1 的等权平均，避免大类掩盖小类；
 - **Recall@K**：对真实 match，正确 target 是否进入 retrieval 前 K；
-- **MRR**：第一个正确 target 排名倒数的平均；
-- **Top-1 correct match rate**：最终第一候选 target 正确的比例；
-- **Auto-accept precision**：达到自动接受阈值的输出中，target 与 relationship 均正确的比例；
-- **Coverage**：所有待匹配 A 中达到指定阈值并被系统处理的比例。
+- **MRR@depth**：第一个已知正确 target 在前 depth 内的排名倒数的平均；截断外计为 0；
+- **Top-1 correct match rate**：在有已知正例的 A 中，最终第一候选 target 命中已标注正例的比例，不代表完整组级准确率；
+- **Auto-accept precision**：标注完整且达到自动接受阈值的输出中，target 与 relationship 均正确的比例；
+- **Coverage**：标注完整的 A 中达到指定阈值的比例；所有 A 的通过率另报为 `all_sources_coverage`。
 
 企业自动化应优先关注 auto-accept precision/coverage 曲线，而不是只看总体 accuracy。类别不平衡时同时审查 macro F1、各类 recall 和 confusion matrix。
 

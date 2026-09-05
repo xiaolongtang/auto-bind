@@ -13,6 +13,8 @@ from typing import Any
 import pandas as pd
 import torch
 
+from .dataset import validate_normalized_pair_labels
+from .evaluation_truth import group_truth_completeness
 from .metrics import (
     classification_metrics,
     end_to_end_metrics,
@@ -26,6 +28,7 @@ from .predict import (
     predict_pairs,
 )
 from .retrieval import cosine_top_k
+from .preprocess import normalize_field_name
 
 
 LOGGER = logging.getLogger("metadata_matcher")
@@ -45,19 +48,37 @@ def _load_evaluation_csv(path: str | Path) -> pd.DataFrame:
         )
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Evaluation CSV does not exist: {csv_path}") from exc
+    return _validated_evaluation_frame(frame, context=str(csv_path))
+
+
+def _validated_evaluation_frame(
+    dataframe: pd.DataFrame, *, context: str = "evaluation dataframe"
+) -> pd.DataFrame:
+    """Validate CLI and library inputs using the same annotation rules."""
+
+    frame = dataframe
     required = ["A", "B", "label"]
     missing = [column for column in required if column not in frame.columns]
     if missing:
-        raise ValueError(f"{csv_path} is missing columns: {missing!r}")
+        raise ValueError(f"{context} is missing columns: {missing!r}")
     if frame[required].isna().any().any():
-        raise ValueError(f"{csv_path} contains missing A, B, or label values")
-    if (frame["A"].str.strip() == "").any() or (frame["B"].str.strip() == "").any():
-        raise ValueError(f"{csv_path} contains blank A or B field names")
+        raise ValueError(f"{context} contains missing A, B, or label values")
     frame = frame.copy()
-    frame["label"] = frame["label"].str.strip().str.upper()
+    for column in ("A", "B"):
+        frame[column] = frame[column].astype(str)
+        empty = frame[column].map(normalize_field_name).eq("")
+        if empty.any():
+            rows = [position + 2 for position, invalid in enumerate(empty) if invalid]
+            raise ValueError(
+                f"{context} has {column} values that normalize to empty text "
+                f"at CSV rows {rows[:10]}"
+            )
+    frame["label"] = frame["label"].astype(str).str.strip().str.upper()
     unknown = sorted(set(frame["label"]) - {"NO_MATCH", *MATCH_LABELS})
     if unknown:
-        raise ValueError(f"Unsupported labels in {csv_path}: {unknown!r}")
+        raise ValueError(f"Unsupported labels in {context}: {unknown!r}")
+    validate_normalized_pair_labels(frame, context=context)
+    group_truth_completeness(frame, context=context)
     return frame
 
 
@@ -69,6 +90,7 @@ def evaluate_pair_classification(
 ) -> dict[str, Any]:
     """Evaluate all human-provided pair labels in a dataframe."""
 
+    dataframe = _validated_evaluation_frame(dataframe)
     predictions = predict_pairs(
         bundle,
         dataframe["A"].astype(str).tolist(),
@@ -105,11 +127,13 @@ def _positive_ground_truth(
     """Build target-to-relationship truth maps and preserve all source order."""
 
     relationships: dict[str, dict[str, str]] = defaultdict(dict)
-    source_order = _unique_in_order(dataframe["A"].astype(str).tolist())
+    source_order = _unique_in_order(
+        dataframe["A"].astype(str).map(normalize_field_name).tolist()
+    )
     positive_rows = dataframe[dataframe["label"].isin(MATCH_LABELS)]
     for row in positive_rows.itertuples(index=False):
-        source = str(row.A)
-        target = str(row.B)
+        source = normalize_field_name(str(row.A))
+        target = normalize_field_name(str(row.B))
         label = str(row.label)
         existing = relationships[source].get(target)
         if existing is not None and existing != label:
@@ -127,6 +151,7 @@ def evaluate_retrieval_and_end_to_end(
     *,
     top_k: int | None = None,
     retrieval_ks: Sequence[int] = (1, 5, 10, 20),
+    retrieval_depth: int | None = None,
     thresholds: Sequence[float] = (0.80, 0.90, 0.95, 0.99),
     batch_size: int | None = None,
     query_chunk_size: int = 256,
@@ -135,25 +160,50 @@ def evaluate_retrieval_and_end_to_end(
     """Evaluate positive-source retrieval and the complete reranking pipeline.
 
     The B candidate group contains every unique target observed in the evaluation
-    CSV, including targets from NO_MATCH rows.  Every positive A contributes only
-    once, and its ground truth may contain multiple valid targets.
+    CSV, including targets from NO_MATCH rows. Names are deduplicated after the
+    same normalization used by the encoder. Group decision metrics require an
+    explicit ``group_truth_complete=true`` annotation; incomplete sources are
+    reported separately and still contribute known-positive retrieval metrics.
     """
 
+    dataframe = _validated_evaluation_frame(dataframe)
+    completeness = group_truth_completeness(dataframe)
     normalized_ks = sorted(set(int(k) for k in retrieval_ks))
     if not normalized_ks or any(k <= 0 for k in normalized_ks):
         raise ValueError("retrieval_ks must contain positive integers")
     resolved_top_k = bundle.config.top_k if top_k is None else int(top_k)
     if resolved_top_k <= 0:
         raise ValueError("top_k must be positive")
+    minimum_depth = max(max(normalized_ks), resolved_top_k)
+    if retrieval_depth is None:
+        retrieval_depth = minimum_depth
+    elif (
+        isinstance(retrieval_depth, bool)
+        or not isinstance(retrieval_depth, int)
+        or retrieval_depth < minimum_depth
+    ):
+        raise ValueError(
+            f"retrieval_depth must be an integer >= {minimum_depth} "
+            "(the largest Recall@K cutoff and reranking top_k)"
+        )
 
     sources, relationship_truth = _positive_ground_truth(dataframe)
     positive_sources = [source for source in sources if relationship_truth.get(source)]
-    targets = _unique_in_order(dataframe["B"].astype(str).tolist())
+    targets = _unique_in_order(
+        dataframe["B"].astype(str).map(normalize_field_name).tolist()
+    )
     if not sources or not targets:
         retrieval_report = retrieval_metrics(
             [[] for _ in positive_sources],
             [set(relationship_truth[source]) for source in positive_sources],
             ks=normalized_ks,
+            mrr_cutoff=retrieval_depth,
+        )
+        retrieval_report.update(
+            candidate_targets=len(targets),
+            retrieval_depth_requested=retrieval_depth,
+            retrieval_depth_effective=0,
+            ranking_is_complete=True,
         )
         end_to_end_report = end_to_end_metrics(
             [],
@@ -167,13 +217,12 @@ def evaluate_retrieval_and_end_to_end(
         )
         end_to_end_report["warning"] = (
             "End-to-end matching metrics are unavailable because the evaluation "
-            "split contains no DIRECT or DERIVATION pairs."
+            "split is empty."
         )
         return retrieval_report, end_to_end_report
 
     source_embeddings = encode_field_names(sources, bundle, batch_size=batch_size)
     target_embeddings = encode_field_names(targets, bundle, batch_size=batch_size)
-    retrieval_depth = max(max(normalized_ks), resolved_top_k)
     scores, indices = cosine_top_k(
         source_embeddings,
         target_embeddings,
@@ -194,8 +243,15 @@ def evaluate_retrieval_and_end_to_end(
         [ranked_targets[source_to_position[source]] for source in positive_sources],
         [set(relationship_truth[source]) for source in positive_sources],
         ks=normalized_ks,
+        mrr_cutoff=retrieval_depth,
     )
-    retrieval_report["candidate_targets"] = len(targets)
+    retrieval_report.update(
+        candidate_targets=len(targets),
+        retrieval_depth_requested=retrieval_depth,
+        retrieval_depth_effective=int(indices.shape[1]),
+        ranking_is_complete=int(indices.shape[1]) == len(targets),
+        field_identity="normalized_name",
+    )
 
     e2e_depth = min(resolved_top_k, indices.shape[1])
     e2e_indices = indices[:, :e2e_depth]
@@ -249,12 +305,14 @@ def evaluate_retrieval_and_end_to_end(
         confidences,
         [set(relationship_truth.get(source, {})) for source in sources],
         accepted_labels,
+        ground_truth_complete=[completeness[source] for source in sources],
         thresholds=thresholds,
         review_threshold=bundle.config.review_threshold,
         auto_accept_threshold=bundle.config.auto_accept_threshold,
     )
     end_to_end_report["retrieval_top_k_for_reranking"] = e2e_depth
     end_to_end_report["candidate_targets"] = len(targets)
+    end_to_end_report["field_identity"] = "normalized_name"
     # Useful diagnostic: retrieval cosine of the MLP-selected candidate.  It is
     # intentionally not treated as a confidence score.
     end_to_end_report["mean_selected_retrieval_similarity"] = float(
@@ -270,6 +328,7 @@ def evaluate_dataframe(
     dataframe: pd.DataFrame,
     *,
     top_k: int | None = None,
+    retrieval_depth: int | None = None,
     thresholds: Sequence[float] = (0.80, 0.90, 0.95, 0.99),
     batch_size: int | None = None,
     query_chunk_size: int = 256,
@@ -278,18 +337,8 @@ def evaluate_dataframe(
 ) -> dict[str, Any]:
     """Evaluate a validated dataframe and return a JSON-ready report."""
 
+    frame = _validated_evaluation_frame(dataframe)
     bundle = model if isinstance(model, ModelBundle) else load_model_bundle(model, device=device)
-    required = {"A", "B", "label"}
-    missing = sorted(required - set(dataframe.columns))
-    if missing:
-        raise ValueError(f"Evaluation dataframe is missing columns: {missing!r}")
-    frame = dataframe.copy()
-    frame["A"] = frame["A"].astype(str)
-    frame["B"] = frame["B"].astype(str)
-    frame["label"] = frame["label"].astype(str).str.strip().str.upper()
-    unknown = sorted(set(frame["label"]) - set(bundle.label_map))
-    if unknown:
-        raise ValueError(f"Unsupported evaluation labels: {unknown!r}")
 
     pair_report = evaluate_pair_classification(
         bundle, frame, batch_size=batch_size
@@ -298,6 +347,7 @@ def evaluate_dataframe(
         bundle,
         frame,
         top_k=top_k,
+        retrieval_depth=retrieval_depth,
         thresholds=thresholds,
         batch_size=batch_size,
         query_chunk_size=query_chunk_size,
@@ -323,6 +373,7 @@ def evaluate_model(
     *,
     output_path: str | Path | None = None,
     top_k: int | None = None,
+    retrieval_depth: int | None = None,
     thresholds: Sequence[float] = (0.80, 0.90, 0.95, 0.99),
     batch_size: int | None = None,
     query_chunk_size: int = 256,
@@ -335,6 +386,7 @@ def evaluate_model(
         model_dir,
         frame,
         top_k=top_k,
+        retrieval_depth=retrieval_depth,
         thresholds=thresholds,
         batch_size=batch_size,
         query_chunk_size=query_chunk_size,
@@ -359,6 +411,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test", required=True, type=Path, help="Labeled A,B,label CSV")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument(
+        "--retrieval-depth", type=int, default=None,
+        help="MRR cutoff; defaults to max(20, top_k), must be >= max(20, top_k)",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--query-chunk-size", type=int, default=256)
     parser.add_argument("--candidate-chunk-size", type=int, default=None)
@@ -380,6 +436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.test,
         output_path=args.output,
         top_k=args.top_k,
+        retrieval_depth=args.retrieval_depth,
         thresholds=args.thresholds,
         batch_size=args.batch_size,
         query_chunk_size=args.query_chunk_size,

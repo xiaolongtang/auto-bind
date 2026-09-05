@@ -95,6 +95,33 @@ def test_retrieval_metrics_count_each_source_once_with_multiple_truths() -> None
     assert metrics["evaluated_sources"] == 2
 
 
+def test_truncated_mrr_is_named_by_depth_and_ignores_later_hits() -> None:
+    rankings = [[f"target_{rank}" for rank in range(1, 31)]]
+    truth = [{"target_25"}]
+
+    truncated = retrieval_metrics(rankings, truth, mrr_cutoff=20)
+    assert truncated["MRR@20"] == truncated["mrr_at_20"] == 0.0
+    assert truncated["mrr_cutoff"] == 20
+    assert "MRR" not in truncated and "mrr" not in truncated
+    assert truncated["Recall@20"] == 0.0
+
+    deeper = retrieval_metrics(rankings, truth, ks=(1, 20, 25), mrr_cutoff=25)
+    assert deeper["MRR@25"] == pytest.approx(1 / 25)
+    assert deeper["Recall@25"] == 1.0
+    assert retrieval_metrics(rankings, truth)["MRR"] == pytest.approx(1 / 25)
+
+
+@pytest.mark.parametrize("cutoff", [0, -1, 1.5, True, "20"])
+def test_retrieval_metrics_reject_invalid_mrr_cutoff(cutoff) -> None:
+    with pytest.raises(ValueError, match="mrr_cutoff"):
+        retrieval_metrics([["b"]], [{"b"}], mrr_cutoff=cutoff)
+
+
+def test_recall_cutoffs_cannot_exceed_declared_retrieval_depth() -> None:
+    with pytest.raises(ValueError, match="must not exceed"):
+        retrieval_metrics([["b"]], [{"b"}], ks=(1, 20), mrr_cutoff=10)
+
+
 def test_classification_metrics_include_all_three_classes() -> None:
     metrics = classification_metrics([0, 1, 2, 2], [0, 2, 2, 1])
 
@@ -115,7 +142,7 @@ def test_threshold_precision_coverage_and_no_match_gating() -> None:
     assert table[0]["coverage"] == pytest.approx(3 / 4)
     assert table[1]["precision"] == pytest.approx(1 / 2)
 
-    # The second source has no positive target.  Its low-confidence rejection is
+    # Only explicitly complete annotation makes the second source's rejection
     # a correct group-level NO_MATCH at the operational review threshold.
     metrics = end_to_end_metrics(
         ["target", "candidate"],
@@ -125,6 +152,7 @@ def test_threshold_precision_coverage_and_no_match_gating() -> None:
         [{"DIRECT"}, set()],
         thresholds=(0.80, 0.95),
         review_threshold=0.80,
+        ground_truth_complete=[True, True],
     )
     assert metrics["overall_end_to_end_accuracy"] == pytest.approx(1.0)
     assert metrics["relationship_classification_accuracy"] == pytest.approx(1.0)
@@ -134,6 +162,106 @@ def test_threshold_precision_coverage_and_no_match_gating() -> None:
     assert metrics["auto_accept_precision"] == pytest.approx(1.0)
     assert metrics["coverage"] == pytest.approx(0.5)
     assert metrics["no_match_only_sources"] == 1
+
+
+def test_unannotated_positive_is_unknown_not_correct_no_match_rejection() -> None:
+    metrics = end_to_end_metrics(
+        ["unjudged_candidate"],
+        ["DIRECT"],
+        [0.1],
+        [set()],
+        [set()],
+    )
+    assert metrics["total_sources"] == 1
+    assert metrics["evaluated_sources"] == 0
+    assert metrics["excluded_incomplete_sources"] == 1
+    assert metrics["unknown_no_match_sources"] == 1
+    assert metrics["no_match_only_sources"] == 0
+    assert metrics["overall_end_to_end_accuracy"] is None
+    assert metrics["relationship_classification_accuracy"] is None
+    assert metrics["auto_accept_precision"] is None
+    assert metrics["coverage"] is None
+    assert "incomplete ground truth" in metrics["warning"]
+    for row in metrics["threshold_precision_coverage"]:
+        assert row["precision"] is None
+        assert row["coverage"] is None
+        assert row["evaluated_sources"] == row["accepted_count"] == 0
+        assert row["all_sources_coverage"] == 0.0
+
+
+def test_partial_sources_are_excluded_from_all_group_metric_denominators() -> None:
+    metrics = end_to_end_metrics(
+        ["b", "unknown", "wrong", "unjudged"],
+        ["DIRECT", "DIRECT", "DIRECT", "DIRECT"],
+        [0.99, 0.99, 0.99, 0.1],
+        [{"b"}, set(), {"known_positive"}, set()],
+        [{"DIRECT"}, set(), {"DIRECT"}, set()],
+        thresholds=(0.95,),
+        ground_truth_complete=[True, False, False, True],
+    )
+    assert metrics["total_sources"] == 4
+    assert metrics["evaluated_sources"] == 2
+    assert metrics["excluded_incomplete_sources"] == 2
+    assert metrics["known_positive_sources"] == 2
+    assert metrics["positive_sources"] == 1
+    assert metrics["incomplete_positive_sources"] == 1
+    assert metrics["unknown_no_match_sources"] == 1
+    assert metrics["no_match_only_sources"] == 1
+    assert metrics["top_1_correct_match_rate"] == pytest.approx(0.5)
+    assert metrics["raw_positive_end_to_end_accuracy"] == pytest.approx(0.5)
+    assert metrics["overall_end_to_end_accuracy"] == 1.0
+    assert metrics["relationship_classification_accuracy"] == 1.0
+    assert metrics["auto_accept_precision"] == 1.0
+    assert metrics["coverage"] == 0.5
+    assert metrics["auto_accept_count"] == 1
+    assert metrics["all_sources_auto_accept_coverage"] == 0.75
+    assert metrics["excluded_incomplete_auto_accept_count"] == 2
+    row = metrics["threshold_precision_coverage"][0]
+    assert row["precision"] == 1.0
+    assert row["coverage"] == 0.5
+    assert row["accepted_count"] == row["correct_count"] == 1
+    assert row["all_sources_accepted_count"] == 3
+    assert row["all_sources_coverage"] == 0.75
+    assert row["excluded_incomplete_accepted_count"] == 2
+
+
+def test_complete_no_match_acceptance_is_a_group_error() -> None:
+    metrics = end_to_end_metrics(
+        ["candidate"], ["DIRECT"], [0.99], [set()], [set()],
+        ground_truth_complete=[True],
+    )
+    assert metrics["overall_end_to_end_accuracy"] == 0.0
+    assert metrics["relationship_classification_accuracy"] == 0.0
+    assert metrics["auto_accept_precision"] == 0.0
+    assert metrics["coverage"] == 1.0
+    assert metrics["unknown_no_match_sources"] == 0
+    assert metrics["no_match_only_sources"] == 1
+
+
+@pytest.mark.parametrize("flags", [[], [True, False], [1], ["true"], [None]])
+def test_group_completeness_requires_one_boolean_flag_per_source(flags) -> None:
+    with pytest.raises(ValueError, match="ground_truth_complete"):
+        end_to_end_metrics(
+            ["b"], ["DIRECT"], [0.99], [{"b"}], [{"DIRECT"}],
+            ground_truth_complete=flags,
+        )
+
+
+@pytest.mark.parametrize("confidences", [[float("nan")], [float("inf")], [[0.99]]])
+def test_incomplete_truth_does_not_hide_invalid_confidence_input(confidences) -> None:
+    with pytest.raises(ValueError, match="match_probabilities"):
+        end_to_end_metrics(
+            ["b"], ["DIRECT"], confidences, [{"b"}], [{"DIRECT"}],
+        )
+
+
+def test_empty_group_evaluation_has_no_accuracy_denominator() -> None:
+    metrics = end_to_end_metrics([], [], [], [], [])
+    assert metrics["total_sources"] == metrics["evaluated_sources"] == 0
+    assert metrics["overall_end_to_end_accuracy"] is None
+    assert metrics["auto_accept_precision"] is None
+    assert metrics["coverage"] is None
+    assert metrics["all_sources_auto_accept_coverage"] is None
 
 
 def test_saved_models_reload_with_identical_pair_prediction(tmp_path) -> None:

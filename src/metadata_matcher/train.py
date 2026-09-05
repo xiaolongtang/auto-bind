@@ -14,7 +14,8 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from .config import MatcherConfig
-from .dataset import LABEL_MAP, PairDataset
+from .dataset import LABEL_MAP, PairDataset, validate_normalized_pair_labels
+from .evaluation_truth import group_truth_completeness
 from .model import FieldEncoder, PairClassifier
 from .negatives import generate_synthetic_negatives
 from .preprocess import normalize_field_name
@@ -57,7 +58,10 @@ def read_labeled_csv(path: str | Path, split_name: str) -> pd.DataFrame:
         raise DataValidationError(
             f"{split_name} CSV is missing columns: {', '.join(missing)}"
         )
-    frame = frame.loc[:, EXPECTED_COLUMNS].copy()
+    columns = [*EXPECTED_COLUMNS]
+    if "group_truth_complete" in frame:
+        columns.append("group_truth_complete")
+    frame = frame.loc[:, columns].copy()
     for column in ("A", "B"):
         frame[column] = frame[column].astype(str)
         invalid = frame[column].map(lambda value: not bool(value.strip()))
@@ -84,6 +88,11 @@ def read_labeled_csv(path: str | Path, split_name: str) -> pd.DataFrame:
         )
     if frame.empty:
         raise DataValidationError(f"{split_name} CSV contains no rows")
+    try:
+        validate_normalized_pair_labels(frame, context=f"{split_name} CSV {csv_path}")
+        group_truth_completeness(frame, context=f"{split_name} CSV {csv_path}")
+    except ValueError as exc:
+        raise DataValidationError(str(exc)) from exc
     return frame.reset_index(drop=True)
 
 
@@ -210,7 +219,12 @@ def _make_loader(
     *,
     shuffle: bool,
 ) -> DataLoader:
-    dataset = PairDataset(frame, vocab, config.max_length)
+    dataset = PairDataset(
+        frame,
+        vocab,
+        config.max_length,
+        synthetic_negative_weight=config.synthetic_negative_weight,
+    )
     generator = torch.Generator().manual_seed(config.seed)
     return DataLoader(
         dataset,
@@ -304,7 +318,8 @@ def _run_encoder_epoch(
                 torch.full_like(labels, -1, dtype=torch.float32),
                 torch.ones_like(labels, dtype=torch.float32),
             )
-            loss = criterion(embedding_a, embedding_b, targets)
+            per_sample_loss = criterion(embedding_a, embedding_b, targets)
+            loss = (per_sample_loss * batch["sample_weight"]).mean()
             if training:
                 loss.backward()
                 optimizer.step()
@@ -350,7 +365,8 @@ def _run_classifier_epoch(
             embedding_b = embedding_b.detach()
         with torch.set_grad_enabled(training):
             logits = classifier(embedding_a, embedding_b)
-            loss = criterion(logits, labels)
+            per_sample_loss = criterion(logits, labels)
+            loss = (per_sample_loss * batch["sample_weight"]).mean()
             if training:
                 loss.backward()
                 optimizer.step()
@@ -423,6 +439,9 @@ def train_model(
         list(train_frame["A"].astype(str)) + list(train_frame["B"].astype(str))
     )
 
+    # Explicit provenance distinguishes verified annotations from generated
+    # negatives, including after concatenation and DataLoader collation.
+    train_frame = train_frame.assign(synthetic=False, negative_type="human")
     training_frame = train_frame
     generated_count = 0
     if not (train_frame["label"] == "NO_MATCH").any():
@@ -485,7 +504,9 @@ def train_model(
     validation_loader = _make_loader(validation_frame, vocab, config, shuffle=False)
 
     encoder = _build_encoder(len(vocab), config)
-    cosine_criterion = nn.CosineEmbeddingLoss(margin=config.cosine_margin)
+    cosine_criterion = nn.CosineEmbeddingLoss(
+        margin=config.cosine_margin, reduction="none"
+    )
     encoder_optimizer = torch.optim.AdamW(
         encoder.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
@@ -493,6 +514,11 @@ def train_model(
         "phase_1_encoder": [],
         "phase_2_classifier": [],
         "synthetic_training_negatives": len(training_frame) - len(train_frame),
+        "synthetic_negative_weight": config.synthetic_negative_weight,
+        "synthetic_negative_counts_by_type": (
+            training_frame.loc[training_frame["synthetic"], "negative_type"]
+            .value_counts().astype(int).to_dict()
+        ),
     }
 
     best_encoder_state: dict[str, Tensor] | None = None
@@ -550,7 +576,7 @@ def train_model(
         lr=config.classifier_learning_rate,
         weight_decay=config.weight_decay,
     )
-    classifier_criterion = nn.CrossEntropyLoss()
+    classifier_criterion = nn.CrossEntropyLoss(reduction="none")
     best_classifier_state: dict[str, Tensor] | None = None
     best_joint_encoder_state: dict[str, Tensor] | None = None
     best_loss = float("inf")

@@ -22,6 +22,7 @@
   "random_negatives_per_positive": 1,
   "hard_negatives_per_positive": 1,
   "hard_negative_pool_size": 100,
+  "synthetic_negative_weight": 1.0,
   "top_k": 10,
   "review_threshold": 0.8,
   "auto_accept_threshold": 0.95,

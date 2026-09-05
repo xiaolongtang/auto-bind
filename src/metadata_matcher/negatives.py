@@ -142,7 +142,9 @@ def generate_synthetic_negatives(
     the highest :class:`difflib.SequenceMatcher` similarity within a bounded,
     seeded candidate pool. The pool prevents a full target scan per positive.
     Every known DIRECT/DERIVATION target for the same normalized source is
-    excluded from both strategies.
+    excluded from both strategies, as is any target identical to that source
+    after normalization. A name-only shared encoder cannot separate identical
+    inputs. Returned rows carry ``synthetic=True`` and their ``negative_type``.
 
     This function returns generated rows only. Use
     :func:`augment_training_data_if_needed` to conditionally append them when a
@@ -168,9 +170,12 @@ def generate_synthetic_negatives(
     working["_norm_a"] = working[source_column].astype(str).map(normalize_field_name)
     working["_norm_b"] = working[target_column].astype(str).map(normalize_field_name)
 
+    output_columns = [
+        source_column, target_column, label_column, "synthetic", "negative_type"
+    ]
     positive_rows = working[working[label_column].isin(POSITIVE_LABELS)]
     if positive_rows.empty:
-        return pd.DataFrame(columns=[source_column, target_column, label_column])
+        return pd.DataFrame(columns=output_columns)
 
     known_positive_targets: dict[str, set[str]] = {}
     for row in positive_rows.itertuples(index=False, name=None):
@@ -186,12 +191,16 @@ def generate_synthetic_negatives(
         target_by_normalized.setdefault(normalize_field_name(target), target)
     all_targets = tuple(target_by_normalized)
 
-    synthetic_rows: list[dict[str, str]] = []
+    synthetic_rows: list[dict[str, str | bool]] = []
     rng = random.Random(config.seed)
     for row in positive_rows.itertuples(index=False, name=None):
         source = str(row[0])
         norm_a = str(row[3])
-        excluded = known_positive_targets[norm_a]
+        excluded = known_positive_targets[norm_a].copy()
+        # Keep exclusions inside the target universe: the bounded sampler uses
+        # their count to calculate the number of eligible targets.
+        if norm_a in target_by_normalized:
+            excluded.add(norm_a)
         eligible_count = len(all_targets) - len(excluded)
         if eligible_count <= 0:
             LOGGER.warning(
@@ -228,6 +237,8 @@ def generate_synthetic_negatives(
                     source_column: source,
                     target_column: target_by_normalized[normalized_target],
                     label_column: "NO_MATCH",
+                    "synthetic": True,
+                    "negative_type": "hard",
                 }
             )
 
@@ -256,11 +267,13 @@ def generate_synthetic_negatives(
                     source_column: source,
                     target_column: target_by_normalized[normalized_target],
                     label_column: "NO_MATCH",
+                    "synthetic": True,
+                    "negative_type": "random",
                 }
             )
 
     return pd.DataFrame(
-        synthetic_rows, columns=[source_column, target_column, label_column]
+        synthetic_rows, columns=output_columns
     )
 
 
@@ -280,14 +293,19 @@ def augment_training_data_if_needed(
     Returns:
         ``(dataframe, generated)`` where ``generated`` reports whether
         synthetic rows were appended. If human negatives exist, a defensive
-        copy of the original dataframe and ``False`` are returned.
+        copy with explicit human provenance and ``False`` are returned.
     """
 
     _validate_columns(
         train_dataframe, source_column, target_column, label_column
     )
+    original = train_dataframe.copy()
+    if "synthetic" not in original:
+        original["synthetic"] = False
+    if "negative_type" not in original:
+        original["negative_type"] = "human"
     if contains_no_match(train_dataframe, label_column=label_column):
-        return train_dataframe.copy(), False
+        return original, False
 
     negatives = generate_synthetic_negatives(
         train_dataframe,
@@ -299,5 +317,5 @@ def augment_training_data_if_needed(
         target_column=target_column,
         label_column=label_column,
     )
-    augmented = pd.concat([train_dataframe, negatives], ignore_index=True)
+    augmented = pd.concat([original, negatives], ignore_index=True)
     return augmented, not negatives.empty

@@ -46,6 +46,7 @@ class MatcherConfig:
     random_negatives_per_positive: int = 1
     hard_negatives_per_positive: int = 1
     hard_negative_pool_size: int = 100
+    synthetic_negative_weight: float = 1.0
     top_k: int = 10
     review_threshold: float = 0.80
     auto_accept_threshold: float = 0.95
@@ -91,6 +92,7 @@ class MatcherConfig:
             "early_stopping_min_delta": self.early_stopping_min_delta,
             "review_threshold": self.review_threshold,
             "auto_accept_threshold": self.auto_accept_threshold,
+            "synthetic_negative_weight": self.synthetic_negative_weight,
         }
         for name, value in numeric_values.items():
             if isinstance(value, bool) or not isinstance(value, Real):
@@ -135,6 +137,8 @@ class MatcherConfig:
             raise ValueError("early_stopping_min_delta must be >= 0")
         if self.random_negatives_per_positive < 0 or self.hard_negatives_per_positive < 0:
             raise ValueError("synthetic negative counts must be >= 0")
+        if not 0.0 < self.synthetic_negative_weight <= 1.0:
+            raise ValueError("synthetic_negative_weight must be in (0, 1]")
         for name, value in {
             "learning_rate": self.learning_rate,
             "classifier_learning_rate": self.classifier_learning_rate,
