@@ -42,7 +42,11 @@ def read_labeled_csv(path: str | Path, split_name: str) -> pd.DataFrame:
 
     csv_path = Path(path)
     if not csv_path.is_file():
-        raise DataValidationError(f"{split_name} CSV does not exist: {csv_path}")
+        raise DataValidationError(
+            f"{split_name} CSV does not exist: {csv_path}. "
+            "Run prepare_dataset.py --input data.csv --output-dir data_split "
+            "first, or supply --data-dir / explicit split paths."
+        )
     try:
         frame = pd.read_csv(
             csv_path,
@@ -87,7 +91,11 @@ def read_labeled_csv(path: str | Path, split_name: str) -> pd.DataFrame:
             f"{list(EXPECTED_LABEL_MAP)}"
         )
     if frame.empty:
-        raise DataValidationError(f"{split_name} CSV contains no rows")
+        raise DataValidationError(
+            f"{split_name} CSV contains no rows. Inspect split_report.md and "
+            "provide more independent annotated field components; empty splits "
+            "cannot be used for training or formal evaluation."
+        )
     try:
         validate_normalized_pair_labels(frame, context=f"{split_name} CSV {csv_path}")
         group_truth_completeness(frame, context=f"{split_name} CSV {csv_path}")
@@ -146,19 +154,28 @@ def check_split_leakage(
 
 
 def validate_data_files(
-    train_path: str | Path,
-    validation_path: str | Path,
-    test_path: str | Path,
+    train_path: str | Path | None = None,
+    validation_path: str | Path | None = None,
+    test_path: str | Path | None = None,
     *,
-    strict_leakage_check: bool,
+    data_dir: str | Path = "data_split",
+    strict_leakage_check: bool = True,
     logger: logging.Logger | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Load the pre-made splits and enforce optional field-disjointness."""
+    """Load prepared splits, allowing explicit legacy paths to override the directory."""
 
     log = logger or logging.getLogger("metadata_matcher")
-    train = read_labeled_csv(train_path, "train")
-    validation = read_labeled_csv(validation_path, "validation")
-    test = read_labeled_csv(test_path, "test")
+    split_paths = {
+        name: Path(path) if path is not None else Path(data_dir) / f"{name}.csv"
+        for name, path in (
+            ("train", train_path),
+            ("validation", validation_path),
+            ("test", test_path),
+        )
+    }
+    train = read_labeled_csv(split_paths["train"], "train")
+    validation = read_labeled_csv(split_paths["validation"], "validation")
+    test = read_labeled_csv(split_paths["test"], "test")
     splits = {"train": train, "validation": validation, "test": test}
     leakage = check_split_leakage(splits)
 
@@ -187,6 +204,7 @@ def validate_data_files(
             )
 
     report: dict[str, Any] = {
+        "input_files": {name: str(path.resolve()) for name, path in split_paths.items()},
         "rows": {name: len(frame) for name, frame in splits.items()},
         "label_counts": {
             name: {
@@ -407,14 +425,19 @@ def _build_classifier(config: MatcherConfig) -> PairClassifier:
 
 def train_model(
     *,
-    train_path: str | Path,
-    validation_path: str | Path,
-    test_path: str | Path,
+    train_path: str | Path | None = None,
+    validation_path: str | Path | None = None,
+    test_path: str | Path | None = None,
     config: MatcherConfig,
+    data_dir: str | Path = "data_split",
     artifacts_dir: str | Path = "artifacts",
     strict_leakage_check: bool = True,
 ) -> Path:
-    """Run both training phases and return the newly created model directory."""
+    """Train from prepared splits and return the newly created model directory.
+
+    By default, read train.csv, validation.csv, and test.csv in ``data_split``.
+    Explicit paths override the corresponding file inside ``data_dir``.
+    """
 
     if dict(LABEL_MAP) != EXPECTED_LABEL_MAP:
         raise RuntimeError(
@@ -429,6 +452,7 @@ def train_model(
         train_path,
         validation_path,
         test_path,
+        data_dir=data_dir,
         strict_leakage_check=strict_leakage_check,
         logger=preflight_logger,
     )

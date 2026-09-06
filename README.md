@@ -17,6 +17,17 @@ python scripts/match_groups.py --model-dir artifacts/run_YYYYMMDD_HHMMSS --sourc
 
 Windows PowerShell 的环境创建与激活方式见 [Installation](#installation)。
 
+真实数据到位后，从仓库根目录按以下顺序运行。`data.csv` 需包含人工确认的 `A,B,label`；无需手工拆分，训练和评估会直接读取生成的文件：
+
+```bash
+python prepare_dataset.py --input data.csv --output-dir data_split --train-ratio 0.70 --val-ratio 0.15 --test-ratio 0.15 --seed 42
+python scripts/validate_data.py --data-dir data_split --strict-leakage-check
+python scripts/train_model.py --config config.example.json --data-dir data_split --artifacts-dir artifacts
+python scripts/evaluate_model.py --model-dir artifacts/run_YYYYMMDD_HHMMSS --data-dir data_split --split test --output artifacts/run_YYYYMMDD_HHMMSS/evaluation.json
+```
+
+先确认清洗命令成功退出并检查 `data_split/split_report.md`，再执行后续命令。`--data-dir` 默认是 `data_split`，可省略；评估的 `--split` 默认是 `test`，也可选 `validation`。训练和校验仍支持 `--train`、`--validation`、`--test` 覆盖对应默认文件；评估支持 `--test` 覆盖所选文件，因此上面的示例数据 Quick Start 继续可用。
+
 ## What It Does
 
 系统接收两组 metadata field：Source fields（A group）和 Target fields（B group）。它为每个 A 字段寻找最可能对应的 B 字段，并判断关系类型：
@@ -83,13 +94,16 @@ Char CNN 的优势是模型小、CPU 友好、训练快、不依赖预训练模�
 ```text
 .
 ├── config.example.json
+├── prepare_dataset.py
 ├── data/
 │   ├── README.md
 │   └── examples/
 ├── artifacts/
+├── data_split/                 # 运行清洗后生成，不提交 Git
 ├── src/metadata_matcher/
 │   ├── config.py
 │   ├── preprocess.py
+│   ├── prepare_dataset.py
 │   ├── vocab.py
 │   ├── dataset.py
 │   ├── negatives.py
@@ -143,12 +157,12 @@ python -m pip install -e . --no-deps
 
 ## Training Data
 
-训练输入为三个已经预先拆分好的 UTF-8 CSV，程序不会再次 random split：
+原始数据放在仓库根目录的 `data.csv`，或通过 `--input` 指定其他本地路径。清洗程序生成三个 UTF-8 CSV，训练程序直接使用它们，不会再次 random split：
 
 ```text
-data/train.csv
-data/validation.csv
-data/test.csv
+data_split/train.csv
+data_split/validation.csv
+data_split/test.csv
 ```
 
 每个文件必须包含如下表头：
@@ -162,10 +176,57 @@ sale_price,employee_id,NO_MATCH
 
 标签只允许 `NO_MATCH`、`DIRECT`、`DERIVATION`。CSV 读取兼容 UTF-8 BOM；建议字段值非空，并在导入前确认引号和逗号转义正确。仓库中的 `data/examples/` 是 field-disjoint 的微型演示集，不是质量基准。
 
+### Prepare and Split Raw Data
+
+`prepare_dataset.py` 仅使用 Python 标准库，无需额外依赖；它可在安装模型依赖前单独运行，不访问互联网：
+
+```bash
+python prepare_dataset.py \
+  --input data.csv \
+  --output-dir data_split \
+  --train-ratio 0.70 \
+  --val-ratio 0.15 \
+  --test-ratio 0.15 \
+  --seed 42 \
+  --hard-positive-threshold 0.4 \
+  --hard-negative-threshold 0.7
+```
+
+程序要求至少包含 `A,B,label` 列。标签会 trim 并转为大写，输出保留 A/B 原文；空字段、空标签、非法标签及规范化后为空的字段会隔离到 `rejected_rows.csv`，报告记录原因。相同原始 `A,B,label` 只保留一条；相同原始或规范化 `(A,B)` 出现互斥标签时，相关记录全部隔离到 `conflicting_pairs.csv`，不猜测正确标签。重复与冲突统计见报告。
+
+若输入有可选 `synthetic` 列，值会 trim 并转小写：`true/1/yes` 的记录作为显式合成数据隔离，`false/0/no` 可继续清洗，空值及其他值按无效标记隔离。没有该列不等于程序已证明数据由人工确认。处理虚构示例时可加 `--example-data`，在报告中标记其不能作为正式评估依据。
+
+划分使用与模型一致的字段 normalization，将 A/B 两列中的所有规范化字段视作同一个节点空间，并对三种标签的每条字段对建立边。每个连通分量整体进入一个集合；固定 seed 的 greedy 分配尽量接近目标行数和标签分布。**字段完全隔离优先于 70/15/15 的精确比例**，不退回普通随机行划分。高频字段或大量 `NO_MATCH` 边可能连接成巨型分量，报告会列出分量规模分布、最大的 20 个分量和最终实际比例。
+
+输出目录包含以下文件：
+
+| 文件 | 用途 |
+| --- | --- |
+| `train.csv` | 模型训练数据，固定三列 `A,B,label` |
+| `validation.csv` | 选择模型和阈值的数据，固定三列 `A,B,label` |
+| `test.csv` | 最终评估数据，固定三列 `A,B,label` |
+| `test_hard_cases.csv` | 仅从 test 挑出的困难样本，列为 `A,B,label,source_row,similarity,reasons` |
+| `conflicting_pairs.csv` | 待人工复核的标签冲突，列为 `A,B,label,source_row,normalized_A,normalized_B,conflict_type` |
+| `rejected_rows.csv` | 无法使用的记录及原因，列为 `A,B,label,source_row,reason` |
+| `split_report.md` | 数据质量、划分规模、标签分布、分量规模、泄漏检查和限制 |
+| `split_statistics.json` | 对应的机器可读统计 |
+
+困难样本使用规范化字段的 `difflib.SequenceMatcher` 相似度：`DIRECT`/`DERIVATION` 的相似度低于 `--hard-positive-threshold`，或 `NO_MATCH` 的相似度高于 `--hard-negative-threshold`。另外标记规范化后相同的格式变体、相似度高于后者阈值的正例拼写变体，以及可能的缩写；这些是待复核的字符串特征，不能证明存在 typo 或语义关系。`reasons` 用分号连接多个原因，`source_row` 是原始 CSV 记录号（表头计为 1）。困难集是 test 的子集，不应加入 train，也不能作为独立样本集与 test 合并统计。清洗程序不制造任何 synthetic records。原始 CSV 的额外列不会进入三个训练/评估 CSV，也不会自动声明组级 ground truth 完整。
+
+判断划分成功需要同时查看命令退出码与报告：
+
+- 退出码为 `0`，所有目标比例大于零的集合都有数据，三组两两 shared normalized fields 均为 `0`；使用现有训练流程还需 `ready_for_training=true`，即三个集合全部非空；
+- 实际比例和各类数量可用于当前实验；比例偏差、类别缺失和隔离记录可能产生警告，即使退出码为 `0` 也应复核；
+- 没有有效记录，或连通分量无法填满所有目标集合时，仍输出诊断文件，但退出码为 `2`，不要直接开始训练。应修复/补充原始数据或合理调整实验比例，不能拆开分量来消除错误。
+
+三个比例必须在 `[0,1]` 内且总和为 `1`。清洗允许为其他实验将某个比例设为 `0`，此时即使退出码为 `0`，也可能无法接入现有训练；本项目的完整训练流程建议保持三个比例均大于零。
+
+报告不会把文件中的标签当作已核验的人工来源；原始数据是否经过人工确认，需要由数据提供方保证。若源数据没有 `NO_MATCH`，报告会明确说明正式 `NO_MATCH` 评估不可用；若 validation/test 缺少该类别，也会提示评估不完整。即使划分成功，也不代表已具备可靠的三分类质量评估条件。更详细的数据说明见 [data/README.md](data/README.md)。
+
 ### Dataset Requirements
 
 - vocabulary **只从 train dataset 构建**，validation/test 中未见字符映射到 `UNK`，避免数据泄漏；
-- train、validation、test 应由上游固定拆分，优先采用 normalized field-disjoint split；
+- train、validation、test 由清洗程序或上游固定拆分，优先采用 normalized field-disjoint split；
 - 启动训练时会检查 split 之间的 normalized overlap 并输出明显警告；默认训练命令执行 strict leakage check，发现重叠即终止；
 - 每个 split 内，同一标准化 `(A, B)` 不得出现互斥标签（包括 `DIRECT` 与 `DERIVATION` 冲突）。预检会报出原 CSV 记录行号、字段和标签，并在创建 run 前停止；同标签重复允许，不会静默改写标注；
 - 不要用 validation/test 调参后再把同一结果当作无偏 test 指标；
@@ -175,9 +236,7 @@ sale_price,employee_id,NO_MATCH
 
 ```bash
 python scripts/validate_data.py \
-  --train data/train.csv \
-  --validation data/validation.csv \
-  --test data/test.csv \
+  --data-dir data_split \
   --strict-leakage-check
 ```
 
@@ -232,9 +291,7 @@ SettlementDate -> settlement_date
 ```bash
 python scripts/train_model.py \
   --config config.example.json \
-  --train data/train.csv \
-  --validation data/validation.csv \
-  --test data/test.csv \
+  --data-dir data_split \
   --artifacts-dir artifacts \
   --strict-leakage-check
 ```
@@ -248,7 +305,8 @@ python scripts/train_model.py \
 ```bash
 python scripts/evaluate_model.py \
   --model-dir artifacts/run_YYYYMMDD_HHMMSS \
-  --test data/test.csv \
+  --data-dir data_split \
+  --split test \
   --output artifacts/run_YYYYMMDD_HHMMSS/evaluation.json
 ```
 
@@ -439,7 +497,7 @@ artifacts/run_YYYYMMDD_HHMMSS/
 pytest
 ```
 
-测试覆盖 normalization、`PAD`/`UNK`、unknown character、dataset shape/label mapping、encoder 输出维度与 L2 norm、classifier 输出维度、Top-K 排序以及 state-dict save/load 后预测一致性。
+测试覆盖数据清洗与冲突隔离、可重复的字段隔离划分、泄漏检查、normalization、`PAD`/`UNK`、unknown character、dataset shape/label mapping、encoder 输出维度与 L2 norm、classifier 输出维度、Top-K 排序以及 state-dict save/load 后预测一致性。
 
 建议提交前再用小配置把 `embedding_epochs` 和 `classifier_epochs` 临时设为 1–2，完成一次 train → save → load → pair predict → group matching smoke test。不要把 smoke-test 指标解释为模型质量。
 
@@ -503,5 +561,5 @@ vocabulary 只允许从 train 构建，validation/test 的 `UNK` 是预期行为
 - 所有 field、label、model artifact 和日志只在本地文件系统处理；
 - 代码没有 telemetry、cloud API 或远程推理调用；
 - 不自动下载 pretrained weights/tokenizer，不访问互联网模型仓库；
-- `data/*.csv` 和 `artifacts/run_*` 默认被 `.gitignore` 排除，避免误提交企业数据与模型；
+- 根目录 `data.csv`、`data_split/`、`data/*.csv` 和 `artifacts/run_*` 默认被 `.gitignore` 排除，避免误提交企业数据、清洗报告与模型；使用自定义输出目录时应自行加入忽略规则；
 - 示例数据是虚构内容，真实数据仍应遵循公司的访问控制、保留和审计政策。

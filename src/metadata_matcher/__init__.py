@@ -1,67 +1,53 @@
-"""Local-only metadata field matching with a shared character CNN."""
+"""Metadata matching with lazily loaded optional training dependencies.
 
-from .dataset import (
-    ID_TO_LABEL,
-    LABEL_MAP,
-    FieldDataset,
-    PairDataset,
-    build_training_vocabulary,
-    load_pair_csv,
-)
-from .losses import (
-    CosineEmbeddingObjective,
-    cosine_embedding_loss,
-    cosine_targets_from_labels,
-    pair_classification_loss,
-)
-from .model import FieldEncoder, PairClassifier, SiameseFieldMatcher, SiameseModel
-from .negatives import (
-    SYNTHETIC_WARNING,
-    SyntheticNegativeConfig,
-    augment_training_data_if_needed,
-    contains_no_match,
-    generate_synthetic_negatives,
-)
-from .preprocess import normalize_field_name, normalize_field_names
-from .vocab import (
-    PAD_ID,
-    PAD_TOKEN,
-    UNK_ID,
-    UNK_TOKEN,
-    CharacterVocabulary,
-    CharVocabulary,
-    Vocabulary,
-)
+Data preparation and normalization can run with the standard library alone.
+"""
 
-__all__ = [
-    "CharacterVocabulary",
-    "CharVocabulary",
-    "CosineEmbeddingObjective",
-    "FieldDataset",
-    "FieldEncoder",
-    "ID_TO_LABEL",
-    "LABEL_MAP",
-    "PAD_ID",
-    "PAD_TOKEN",
-    "PairClassifier",
-    "PairDataset",
-    "SYNTHETIC_WARNING",
-    "SiameseFieldMatcher",
-    "SiameseModel",
-    "SyntheticNegativeConfig",
-    "UNK_ID",
-    "UNK_TOKEN",
-    "Vocabulary",
-    "augment_training_data_if_needed",
-    "build_training_vocabulary",
-    "contains_no_match",
-    "cosine_embedding_loss",
-    "cosine_targets_from_labels",
-    "generate_synthetic_negatives",
-    "load_pair_csv",
-    "normalize_field_name",
-    "normalize_field_names",
-    "pair_classification_loss",
-]
+from importlib import import_module
+from typing import Any
 
+_EXPORTS = {
+    "ID_TO_LABEL": "dataset",
+    "LABEL_MAP": "dataset",
+    "FieldDataset": "dataset",
+    "PairDataset": "dataset",
+    "build_training_vocabulary": "dataset",
+    "load_pair_csv": "dataset",
+    "CosineEmbeddingObjective": "losses",
+    "cosine_embedding_loss": "losses",
+    "cosine_targets_from_labels": "losses",
+    "pair_classification_loss": "losses",
+    "FieldEncoder": "model",
+    "PairClassifier": "model",
+    "SiameseFieldMatcher": "model",
+    "SiameseModel": "model",
+    "SYNTHETIC_WARNING": "negatives",
+    "SyntheticNegativeConfig": "negatives",
+    "augment_training_data_if_needed": "negatives",
+    "contains_no_match": "negatives",
+    "generate_synthetic_negatives": "negatives",
+    "normalize_field_name": "preprocess",
+    "normalize_field_names": "preprocess",
+    "PAD_ID": "vocab",
+    "PAD_TOKEN": "vocab",
+    "UNK_ID": "vocab",
+    "UNK_TOKEN": "vocab",
+    "CharacterVocabulary": "vocab",
+    "CharVocabulary": "vocab",
+    "Vocabulary": "vocab",
+}
+__all__ = sorted(_EXPORTS)
 __version__ = "0.1.0"
+
+
+def __getattr__(name: str) -> Any:
+    """Load public ML objects only when they are actually requested."""
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

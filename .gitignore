@@ -29,6 +29,8 @@ predicted_pairs.csv
 candidates.csv
 
 # Enterprise datasets: keep documentation and synthetic examples only
+/data.csv
+/data_split/
 data/*.csv
 !data/examples/
 !data/examples/*.csv
