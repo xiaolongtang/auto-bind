@@ -1,0 +1,409 @@
+请为已有的 metadata_matcher 字段匹配模型创建一个独立、可运行的
+FastAPI 项目，项目名 field-matcher-api。
+
+请直接生成完整项目文件、实现代码、测试和 README，不要只提供方案、
+伪代码或 TODO。不要重新训练模型，不要修改原项目的训练代码和模型文件。
+
+一、现有模型与源码
+
+我会提供原项目源码，以及一个训练完成的模型目录，例如：
+
+run_20260907_015601/
+  encoder.pt
+  classifier.pt
+  config.json
+  vocab.json
+  label_map.json
+
+这五个文件来自同一次训练。
+.pt 文件是 PyTorch state_dict，不是 TorchScript，也不是 ONNX。
+
+原项目已有：
+  src/metadata_matcher/
+
+必须先阅读原项目的以下代码，再开发服务：
+  predict.py
+  model.py
+  config.py
+  preprocess.py
+  vocab.py
+  retrieval.py
+
+已有可复用接口：
+
+from metadata_matcher.predict import (
+    load_model_bundle,
+    match_field_groups,
+)
+
+bundle = load_model_bundle(model_dir, device="cpu")
+
+predictions, candidates = match_field_groups(
+    bundle,
+    source_fields,
+    target_fields,
+    top_k=top_k,
+    include_candidates=False,
+)
+
+match_field_groups 返回：
+- predictions：pandas DataFrame，每个 A 一行
+- candidates：关闭候选明细时为 None
+
+predictions 当前包含：
+A
+best_B
+predicted_label
+match_probability
+p_direct
+p_derivation
+retrieval_similarity
+rank
+status
+
+请以实际源码为准核对签名和行为。
+复用现有函数，不重写 normalization、字符编码、CNN、分类器、
+Top-K 检索或阈值判断，不用字符串相似度冒充模型推理。
+
+如果必要的原项目源码不可访问，请明确列出缺失内容，不要猜测架构。
+
+二、项目结构与安装
+
+使用 Python 3.11、FastAPI、Pydantic v2、Uvicorn。
+
+建议结构：
+
+field-matcher-api/
+  app/
+    __init__.py
+    main.py
+    settings.py
+    schemas.py
+    routes.py
+    service.py
+  src/
+    metadata_matcher/
+      ...原项目的完整兼容包...
+  models/
+    .gitkeep
+  tests/
+    test_api.py
+    test_model_integration.py
+  pyproject.toml
+  requirements.txt
+  requirements-dev.txt
+  .env.example
+  .gitignore
+  README.md
+
+将原项目 src/metadata_matcher 完整复制到新项目的 src/ 下，
+保留来源说明，不依赖原项目的绝对路径，不使用 sys.path hack。
+配置正确的 setuptools 包发现，使 app 和 metadata_matcher 均可导入。
+requirements.txt 中使用 -e . 安装本地项目，并声明运行依赖。
+
+运行依赖包含：
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+torch
+numpy
+pandas
+scikit-learn
+tqdm
+
+开发依赖放 requirements-dev.txt：
+-r requirements.txt
+pytest
+httpx
+
+核对实际导入，确保没有遗漏依赖。
+优先沿用模型训练环境兼容的 PyTorch 版本。
+使用经过实际安装验证的兼容版本约束，不编造已验证版本。
+CPU 部署，推理不下载预训练模型、不调用外部 API。
+
+在新项目中执行 python3.11 -m venv .venv 创建虚拟环境，
+所有安装和测试均使用该虚拟环境，禁止全局 pip 安装。
+如环境无法执行或安装失败，如实说明阻碍和已完成内容。
+
+.gitignore 排除：
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+models 下的实际模型文件
+训练数据、日志和其他敏感产物
+
+三、模型加载与配置
+
+使用 FastAPI lifespan：
+- 每个服务进程启动时只加载一次模型。
+- 模型固定使用 CPU，并处于 eval 模式。
+- 把 ModelBundle 保存在服务实例或 app.state 中。
+- 请求复用 bundle，不要每次请求传模型目录重新加载。
+- 模型缺失、损坏或配置不兼容时，启动失败并输出明确错误。
+- 推理使用 torch.inference_mode()，且在实际执行推理的工作线程中进入。
+- 不要暴露模型上传、训练、修改模型目录的 API。
+
+使用环境变量和 .env.example：
+
+MODEL_DIR=./models/run_20260907_015601
+TORCH_NUM_THREADS=8
+MAX_A_ITEMS=1000
+MAX_B_ITEMS=10000
+MAX_FIELD_LENGTH=256
+MAX_TOP_K=100
+MAX_CONCURRENT_INFERENCES=1
+
+MODEL_DIR 相对路径相对于项目根目录解析，避免依赖启动目录。
+TORCH_NUM_THREADS 必须为正整数。
+load_model_bundle 内部会设置 torch 线程数，因此环境变量覆盖值应在
+加载后统一设置，不能在每个请求中修改全局线程配置。
+
+默认 Uvicorn 单进程，每进程最多同时执行一个模型推理。
+CPU 推理应放到线程池执行，不能直接阻塞 async 事件循环。
+采用非阻塞准入控制，达到并发限制立即返回 503，避免无限排队。
+准入名额必须覆盖实际推理生命周期：
+异常时释放，客户端断开时不能在后台推理尚未结束前提前释放。
+
+健康检查不占用推理名额。
+README 说明多 worker 会各加载一份模型，消耗额外内存；
+不能直接把 32 核配置成 32 workers × 每进程 8 个线程。
+
+四、匹配接口
+
+POST /api/v1/match
+Content-Type: application/json
+
+请求示例：
+
+{
+  "A": ["customer_no", "sale_price", "legacy_code"],
+  "B": ["client_id", "sales_amount", "employee_id"],
+  "top_k": 10
+}
+
+请求约定：
+
+1. A、B 是必填的严格字符串数组，不接受数字、null、对象转字符串。
+2. A 至少一个元素；B 允许为空数组。
+3. 每个字段必须非空，且用原项目 normalize_field_name 处理后仍非空。
+4. 原始字符串长度不超过 MAX_FIELD_LENGTH。
+5. 不要为校验而覆盖原始字段拼写，响应保留原始 A。
+6. 数量不能超过 MAX_A_ITEMS、MAX_B_ITEMS。
+7. top_k 可省略，省略时采用 bundle.config.top_k。
+   显式 null、bool、浮点数、字符串均不作为合法 top_k。
+   显式传入值必须为 1 到 MAX_TOP_K 的严格整数。
+   启动时也校验配置默认 top_k 没有超过服务上限。
+8. 实际检索数量为 min(请求或配置 top_k, 规范化去重后的 B 数量)。
+   B 为空时实际检索数量为 0。
+9. 禁止未知请求字段，避免拼写错误被忽略。
+10. 阈值来自模型配置，本接口不开放逐请求修改阈值。
+11. A 与 B 是两组字段，每个 A 在整个 B 中寻找最佳匹配，
+    不是 zip(A, B)，不要求长度相同。
+12. 保留 A 原始顺序与重复项，用 source_index 标识每个输入位置。
+13. B 按现有函数的 normalization 去重，保留第一次出现的原始拼写。
+14. 允许多个 A 匹配同一个 B，不做一对一分配。
+15. 复用现有分块、批量检索，不构造完整 A×B 分类张量。
+
+五、响应格式
+
+HTTP 200 示例：
+
+{
+  "request_id": "服务生成的UUID",
+  "model_version": "run_20260907_015601",
+  "duration_ms": 23.4,
+  "summary": {
+    "source_count": 3,
+    "target_count": 3,
+    "unique_target_count": 3,
+    "effective_top_k": 3,
+    "auto_accept_count": 1,
+    "review_count": 1,
+    "no_match_count": 1
+  },
+  "thresholds": {
+    "review": 0.8,
+    "auto_accept": 0.95
+  },
+  "results": [
+    {
+      "source_index": 0,
+      "A": "customer_no",
+      "B": "client_id",
+      "label": "DIRECT",
+      "status": "AUTO_ACCEPT",
+      "match_probability": 0.97,
+      "retrieval_similarity": 0.91,
+      "reason": "ABOVE_AUTO_ACCEPT_THRESHOLD"
+    },
+    {
+      "source_index": 1,
+      "A": "sale_price",
+      "B": "sales_amount",
+      "label": "DERIVATION",
+      "status": "REVIEW",
+      "match_probability": 0.86,
+      "retrieval_similarity": 0.79,
+      "reason": "REQUIRES_REVIEW"
+    },
+    {
+      "source_index": 2,
+      "A": "legacy_code",
+      "B": null,
+      "label": "NO_MATCH",
+      "status": "NO_MATCH",
+      "match_probability": 0.31,
+      "retrieval_similarity": 0.42,
+      "reason": "BELOW_REVIEW_THRESHOLD"
+    }
+  ]
+}
+
+以上数值和关系仅用于展示 JSON 结构，不是真实预测，不可硬编码。
+
+字段映射：
+- A：predictions["A"]
+- B：predictions["best_B"]，拒绝时将空字符串转换为 JSON null
+- label：predictions["predicted_label"]
+- status：predictions["status"]
+- match_probability：直接来自现有结果
+- retrieval_similarity：直接来自现有结果
+
+其他字段由 API 层生成：
+- source_index 为 A 的零基下标，不能以字段名作为唯一键。
+- model_version 为 MODEL_DIR 的目录名，不返回绝对路径。
+- duration_ms 用单调时钟测量本次处理耗时。
+- summary 的状态数量之和必须等于 len(A)。
+
+阈值规则应与原实现完全一致：
+- score < review：NO_MATCH，B=null，label=NO_MATCH
+- review <= score < auto_accept：REVIEW，保留预测 B 和关系
+- score >= auto_accept：AUTO_ACCEPT，保留预测 B 和关系
+
+reason 枚举：
+ABOVE_AUTO_ACCEPT_THRESHOLD
+REQUIRES_REVIEW
+BELOW_REVIEW_THRESHOLD
+EMPTY_TARGET_GROUP
+
+当 B=[]：
+每个 A 仍返回一条结果：
+B=null
+label=NO_MATCH
+status=NO_MATCH
+match_probability=0.0
+retrieval_similarity=null
+reason=EMPTY_TARGET_GROUP
+
+注意：
+- match_probability=P(DIRECT)+P(DERIVATION)，是模型分数，
+  不代表已校准的真实正确率。
+- 有候选但被拒绝时，分数和余弦相似度仍描述最佳候选，
+  不要强制把它们改成 0。
+- B 为空时 0.0 只是“没有候选”的约定值。
+- retrieval_similarity 是余弦相似度，范围可为 [-1, 1]，
+  不要错误限制为 [0, 1]。
+- DERIVATION 只代表关系类别，不提供字段转换公式。
+- NO_MATCH 表示当前候选集合与阈值下没有接受匹配，
+  不能解释为业务语义上永远不存在匹配。
+- AUTO_ACCEPT 只表示达到配置阈值。
+- 第一版不返回完整候选列表。
+
+使用 Pydantic response_model 定义明确响应类型和枚举。
+NumPy 标量转换为标准 Python 类型。
+NaN/Infinity 统一转换为 null，确保响应是严格合法 JSON。
+
+六、健康检查和错误处理
+
+GET /health/live
+返回进程存活状态。
+
+GET /health/ready
+模型加载完成后返回：
+{
+  "status": "ready",
+  "model_version": "run_20260907_015601"
+}
+未就绪时返回 503。
+
+每个请求生成 UUID request_id，成功与错误响应都返回，
+同时写入 X-Request-ID 响应头。
+
+统一错误格式：
+{
+  "request_id": "UUID",
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "请求参数不合法",
+    "details": []
+  }
+}
+
+错误约定：
+- 请求校验失败，包括无效 JSON：422，VALIDATION_ERROR
+- 推理并发达到上限：503，SERVICE_BUSY
+- 未就绪：503，MODEL_NOT_READY
+- 未预期推理错误：500，INFERENCE_ERROR
+
+校验错误 details 只包含字段位置、错误类型和说明，
+不要原样回显完整输入。
+内部堆栈只写服务日志，不返回文件系统路径或堆栈给调用方。
+日志包含 request_id、model_version、A/B 数量、耗时和结果计数，
+默认不记录原始字段数组。
+
+保留 /docs 和 /openapi.json，提供清晰的中文接口说明与示例。
+
+七、测试
+
+使用 pytest 和 FastAPI TestClient 编写测试，至少覆盖：
+
+1. A/B 正常请求与正确字段映射。
+2. 响应顺序与 A 相同。
+3. A 有重复值时仍保留每行和正确 source_index。
+4. B 规范化重复值保留第一次拼写。
+5. B=[] 的完整响应和 null 序列化。
+6. 三种状态及 review、auto_accept 阈值边界。
+7. 空字段、纯分隔符、非字符串、超长字段、数组超限。
+8. 非法 top_k、未知字段和无效 JSON。
+9. 并发超限立即返回 503，并且异常后名额能恢复。
+10. 多个请求不会重复加载模型。
+11. NaN 不会出现在响应 JSON 中。
+12. 无模型时不能伪装成 ready。
+
+可用可注入的 mock service 测试 API 契约。
+另外提供真实模型集成测试：
+- 通过 TEST_MODEL_DIR 指定真实模型目录。
+- 没有真实模型时明确 skip，并说明原因。
+- 有真实模型时，将 API 返回结果与直接调用
+  match_field_groups 的输出逐项比较，浮点数使用合理容差。
+- 不要断言示例字段必然匹配某个目标。
+- 不要将 mock 测试描述为真实模型效果验证。
+
+八、README 和交付
+
+README 必须说明：
+
+1. 模型五个必需文件和源码的放置方式。
+2. Linux/macOS 与 Windows 的 .venv 创建和激活命令。
+3. pip install -r requirements.txt。
+4. 测试依赖安装与 pytest 命令。
+5. .env 配置方法。
+6. 开发启动：
+   python -m uvicorn app.main:app --reload
+7. 服务器启动：
+   python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+8. curl、Python requests 和 Java 17 HttpClient 的调用示例。
+   requests 仅用于客户端示例，说明安装方式。
+9. 请求、响应、错误码和状态语义。
+10. 多对一匹配、B 去重、A 重复项、空 B、长字段截断等行为。
+    模型按 config.max_length 截断编码；
+    API 最大字段长度限制不代表模型会读取全部字符。
+11. 当前没有真实 NO_MATCH 评估时，拒识能力尚未被可靠验证。
+12. 每个 worker 都加载独立模型，线程数和进程数需要联合压测，
+    不宣称核数越多就一定更快。
+
+生成代码后实际安装依赖并执行测试。
+最后列出项目文件、运行命令、测试结果和未完成事项。
+没有实际运行过的步骤不能声称已验证。
